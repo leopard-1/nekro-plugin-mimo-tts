@@ -1,4 +1,4 @@
-# Nekro-plugin-mimo-tts 文本转小米tts语音插件
+# Nekro_plugin_mimo_tts 文本转小米tts语音插件
 支持将文本通过Mimo-TTS模型转换成语音的插件
 
 ## 特色 🎇
