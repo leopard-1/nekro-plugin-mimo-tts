@@ -77,6 +77,13 @@ sh scripts/fix-napcat-ntsilk.sh --check
 sh scripts/fix-napcat-ntsilk.sh
 ```
 
+如果容器里没有这个脚本，可以直接下载：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leopard-1/nekro-plugin-mimo-tts/main/scripts/fix-napcat-ntsilk.sh -o /tmp/fix-napcat-ntsilk.sh
+sh /tmp/fix-napcat-ntsilk.sh
+```
+
 脚本会：
 
 - 下载带 `ntsilk_s16le` 的 ffmpeg 到 `/usr/local/bin/ffmpeg-ntsilk`；

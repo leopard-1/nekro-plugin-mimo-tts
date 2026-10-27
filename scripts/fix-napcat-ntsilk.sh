@@ -81,8 +81,21 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+download() {
+    url=$1
+    dest=$2
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --max-time 180 -o "$dest" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 180 -O "$dest" "$url"
+    else
+        say "容器内没有 curl 或 wget，无法下载"
+        return 1
+    fi
+}
+
 say "下载 ntsilk ffmpeg..."
-if ! curl -fsSL --max-time 180 -o "$TMP" "$URL_PRIMARY"; then
+if ! download "$URL_PRIMARY" "$TMP"; then
     say "主地址下载失败；请从 $URL_FALLBACK 手动下载 ntsilk-linux-x64 后重试"
     exit 1
 fi
