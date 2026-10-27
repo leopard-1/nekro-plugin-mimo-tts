@@ -1,6 +1,6 @@
 [project]
 name = "nekro-plugin-mimo-tts"
-version = "0.1.0"
+version = "0.2.0"
 description = "Nekro-Agent plugin for Xiaomi MiMo-V2.5-TTS speech synthesis"
 authors = [{ name = "Sakuralis" }]
 readme = "README.md"

@@ -35,7 +35,7 @@ plugin = NekroPlugin(
     name="MiMo 文本转语音",
     module_name="mimo_tts",
     description="基于小米 MiMo-V2.5-TTS 系列模型，将文本合成为语音消息并发送到群聊或私聊。",
-    version="0.1.0",
+    version="0.2.0",
     author="Sakuralis",
     url="https://github.com/leopard-1/nekro-plugin-mimo-tts",
     support_adapter=[
@@ -157,6 +157,21 @@ class MiMoTTSConfig(ConfigBase):
         title="失败时回退文本",
         description="合成或发送语音失败时，是否回退发送原始文本。",
     )
+    VOICE_FILE_FALLBACK: bool = Field(
+        default=True,
+        title="语音发送失败时改发音频文件",
+        description=(
+            "当 NapCat 缺少 ntsilk/ffmpeg 支持，语音消息转换失败时，自动改为发送 WAV 音频文件，"
+            "避免直接丢弃语音或只回退为文本。"
+        ),
+    )
+    VOICE_RETRY_INTERVAL: int = Field(
+        default=1800,
+        title="语音能力重试间隔",
+        description="语音转换失败后，暂停尝试语音消息的秒数；到期后会重新尝试发送语音消息。",
+        ge=60,
+        le=86400,
+    )
     MAX_SEGMENTS_PER_MESSAGE: int = Field(
         default=4,
         title="单次最多语音条数",
@@ -183,6 +198,9 @@ class MiMoTTSConfig(ConfigBase):
 config = plugin.get_config(MiMoTTSConfig)
 _AUTO_TTS_BYPASS: ContextVar[bool] = ContextVar("mimo_tts_bypass", default=False)
 _ORIGINAL_SEND_TEXT: Any = None
+_VOICE_FAILURE_UNTIL: float = 0.0
+_VOICE_FAILURE_REASON: str = ""
+_VOICE_FAILURE_LOGGED_AT: float = 0.0
 
 
 def _normalize_model() -> str:
@@ -285,6 +303,50 @@ def _validate_text(text: str) -> str:
     if not cleaned:
         raise ValueError("语音文本不能为空")
     return cleaned
+
+
+def _is_voice_conversion_error(exc: BaseException) -> bool:
+    """识别 NapCat 缺少 ntsilk 支持导致的语音转换失败。"""
+    text = str(exc).lower()
+    if "ntsilk" in text:
+        return True
+    if "requested output format" in text and "silk" in text:
+        return True
+    if "silk" in text and ("ffmpeg" in text or "转换" in text or "语音" in text):
+        return True
+    return False
+
+
+def _voice_attempt_allowed() -> bool:
+    """语音转换失败后进入冷却期，避免每条消息都触发一次失败。"""
+    return time.monotonic() >= _VOICE_FAILURE_UNTIL
+
+
+def _mark_voice_failure(exc: BaseException) -> None:
+    """记录失败并进入冷却期；同一冷却期内只输出一次修复提示。"""
+    global _VOICE_FAILURE_UNTIL, _VOICE_FAILURE_REASON, _VOICE_FAILURE_LOGGED_AT
+
+    interval = max(60, int(config.VOICE_RETRY_INTERVAL or 1800))
+    _VOICE_FAILURE_UNTIL = time.monotonic() + interval
+    _VOICE_FAILURE_REASON = str(exc).strip()[:500]
+
+    now = time.monotonic()
+    if now - _VOICE_FAILURE_LOGGED_AT < 60:
+        return
+    _VOICE_FAILURE_LOGGED_AT = now
+    fallback_hint = "已临时改为发送音频文件" if config.VOICE_FILE_FALLBACK else "将按配置回退文本"
+    plugin.logger.warning(
+        f"NapCat 语音转换不可用（缺少 ntsilk/ffmpeg 支持），{fallback_hint}；"
+        f"{interval} 秒后重试语音。修复方法见 README 的“语音发送失败”章节。"
+        f"原始错误: {_VOICE_FAILURE_REASON}"
+    )
+
+
+def _voice_status_text() -> str:
+    if _voice_attempt_allowed():
+        return "语音（正常）"
+    remaining = max(0, int(_VOICE_FAILURE_UNTIL - time.monotonic()))
+    return f"语音（转换失败，{remaining} 秒后重试；当前降级为音频文件）"
 
 
 def _estimate_chars_per_segment() -> int:
@@ -461,14 +523,69 @@ async def _send_onebot_record(ctx: AgentCtx, chat_key: str, audio_path: Path, re
         raise ValueError(f"不支持的聊天类型: {db_chat_channel.chat_type}")
 
 
-async def _send_audio_file(ctx: AgentCtx, chat_key: str, audio_path: Path, ref_msg_id: str | None = None) -> None:
+async def _send_onebot_file(ctx: AgentCtx, chat_key: str, audio_path: Path, ref_msg_id: str | None = None) -> None:
+    """在 NapCat 无法完成语音转换时，改为把音频作为文件发送。
+
+    优先走 Nekro 的文件通道；若协议端与 Agent 不在同一挂载环境，则回退到
+    OneBot 的 base64 文件段，避免依赖 SANDBOX_ONEBOT_SERVER_MOUNT_DIR。
+    """
+    try:
+        sandbox_path = await ctx.fs.mixed_forward_file(audio_path, file_name=audio_path.name)
+        await ctx.ms.send_file(chat_key, sandbox_path, ctx, record=True, ref_msg_id=ref_msg_id)
+        return
+    except Exception as exc:
+        plugin.logger.warning(f"通过 Nekro 文件通道发送音频失败，尝试 OneBot base64 直传: {exc}")
+
+    from nekro_agent.adapters.onebot_v11.core.bot import get_bot
+    from nonebot.adapters.onebot.v11 import Message, MessageSegment
+
+    bot = get_bot()
+    db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
+    chat_id = int(db_chat_channel.channel_id.split("_")[1])
+    message = Message()
+    normalized_ref = normalize_ref_msg_id(ref_msg_id)
+    if normalized_ref:
+        message.append(MessageSegment.reply(id_=int(normalized_ref)))
+    audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
+    message.append(
+        MessageSegment(
+            type="file",
+            data={"file": f"base64://{audio_b64}", "name": audio_path.name},
+        ),
+    )
+
+    if db_chat_channel.chat_type == ChatType.GROUP:
+        await bot.call_api("send_group_msg", group_id=chat_id, message=message)
+    elif db_chat_channel.chat_type == ChatType.PRIVATE:
+        await bot.call_api("send_private_msg", user_id=chat_id, message=message)
+    else:
+        raise ValueError(f"不支持的聊天类型: {db_chat_channel.chat_type}")
+
+
+async def _send_audio_file(ctx: AgentCtx, chat_key: str, audio_path: Path, ref_msg_id: str | None = None) -> str:
+    """发送音频，返回实际使用的发送方式（voice / file）。"""
     db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
     if db_chat_channel.adapter_key == "onebot_v11":
-        await _send_onebot_record(ctx, chat_key, audio_path, ref_msg_id)
-        return
+        if _voice_attempt_allowed():
+            try:
+                await _send_onebot_record(ctx, chat_key, audio_path, ref_msg_id)
+                return "voice"
+            except Exception as exc:
+                if not _is_voice_conversion_error(exc):
+                    raise
+                _mark_voice_failure(exc)
+
+        if not config.VOICE_FILE_FALLBACK:
+            raise RuntimeError(
+                "NapCat 语音转换失败，且配置中已关闭“语音发送失败时改发音频文件”",
+            )
+
+        await _send_onebot_file(ctx, chat_key, audio_path, ref_msg_id)
+        return "file"
 
     sandbox_path = await ctx.fs.mixed_forward_file(audio_path, file_name=audio_path.name)
     await ctx.ms.send_file(chat_key, sandbox_path, ctx, record=True, ref_msg_id=ref_msg_id)
+    return "file"
 
 
 async def _send_text_fallback(ctx: AgentCtx, chat_key: str, text: str, ref_msg_id: str | None = None) -> None:
@@ -533,7 +650,7 @@ async def _synthesize_and_send(ctx: AgentCtx, chat_key: str, text: str, ref_msg_
     if not chunks:
         raise ValueError("语音文本为空")
 
-    sent = 0
+    sent_modes: list[str] = []
     durations: list[float] = []
     for index, chunk in enumerate(chunks, start=1):
         audio_path: Path | None = None
@@ -547,8 +664,8 @@ async def _synthesize_and_send(ctx: AgentCtx, chat_key: str, text: str, ref_msg_
                 raise ValueError(
                     f"第 {index} 段语音实际时长 {duration:.1f}s 超过配置上限 {config.MAX_VOICE_DURATION}s",
                 )
-            await _send_audio_file(ctx, chat_key, audio_path, ref_msg_id if index == 1 else None)
-            sent += 1
+            mode = await _send_audio_file(ctx, chat_key, audio_path, ref_msg_id if index == 1 else None)
+            sent_modes.append(mode)
             durations.append(duration)
         finally:
             if audio_path:
@@ -557,8 +674,20 @@ async def _synthesize_and_send(ctx: AgentCtx, chat_key: str, text: str, ref_msg_
     if len(chunks) == max(1, int(config.MAX_SEGMENTS_PER_MESSAGE or 1)) and len("".join(chunks)) < len(cleaned_text):
         plugin.logger.warning("文本过长，已按 MAX_SEGMENTS_PER_MESSAGE 截断后合成")
 
+    voice_count = sent_modes.count("voice")
+    file_count = sent_modes.count("file")
+    summary_parts: list[str] = []
+    if voice_count:
+        summary_parts.append(f"{voice_count} 条语音")
+    if file_count:
+        summary_parts.append(f"{file_count} 个音频文件")
+    summary = "、".join(summary_parts) or "0 条音频"
+
     duration_text = ", ".join(f"{d:.1f}s" for d in durations if d)
-    return f"已发送 {sent} 条 MiMo 语音" + (f"（{duration_text}）" if duration_text else "")
+    suffix = f"（{duration_text}）" if duration_text else ""
+    if file_count:
+        suffix += "（NapCat 语音转换不可用，已改为音频文件；修复方法见 README）"
+    return f"已发送 MiMo 音频：{summary}{suffix}"
 
 
 @plugin.mount_collect_methods()
@@ -687,15 +816,20 @@ async def mimo_tts_status_cmd(context: CommandExecutionContext) -> CommandRespon
         f"模型：{model}",
         f"音色：{'自定义人设' if config.CUSTOM_PERSONA.strip() else _normalize_voice()}",
         f"单条最长：{config.MAX_VOICE_DURATION}s（约 {estimated_limit} 字/段）",
+        f"语音发送：{_voice_status_text()}",
         f"API Key：{'已填写' if config.MIMO_API_KEY.strip() else '未填写'}",
         f"适配器：{ctx.adapter_key}",
     ]
+    if not _voice_attempt_allowed() and _VOICE_FAILURE_REASON:
+        lines.append(f"最近错误：{_VOICE_FAILURE_REASON[:160]}")
     return CmdCtl.success("\n".join(lines))
 
 
 @plugin.on_enabled()
 async def install_auto_tts_hook() -> None:
-    global _ORIGINAL_SEND_TEXT
+    global _ORIGINAL_SEND_TEXT, _VOICE_FAILURE_UNTIL
+
+    _VOICE_FAILURE_UNTIL = 0.0
 
     from nekro_agent.api import message as message_api
 
