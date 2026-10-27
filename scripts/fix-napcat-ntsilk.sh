@@ -37,7 +37,7 @@ is_ready() {
     [ -f "$FFMPEG_BIN" ] || return 1
     grep -q "$MARK" "$FFMPEG_BIN" 2>/dev/null || return 1
     grep -q "$MARK" "$FFPROBE_BIN" 2>/dev/null || return 1
-    "$NTSILK_BIN" -hide_banner -muxers 2>/dev/null | grep -qi ntsilk
+    "$NTSILK_BIN" -hide_banner -encoders 2>/dev/null | grep -qi ntsilk
 }
 
 # 系统 ffmpeg 本身就支持时无需改动
@@ -101,7 +101,7 @@ if ! download "$URL_PRIMARY" "$TMP"; then
 fi
 chmod +x "$TMP"
 
-if ! "$TMP" -hide_banner -muxers 2>/dev/null | grep -qi ntsilk; then
+if ! "$TMP" -hide_banner -encoders 2>/dev/null | grep -qi ntsilk; then
     say "下载到的二进制不包含 ntsilk_s16le，已停止"
     exit 1
 fi
