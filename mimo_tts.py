@@ -27,7 +27,7 @@ from nekro_agent.api.plugin import (
 )
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.models.db_chat_channel import DBChatChannel
-from nekro_agent.schemas.chat_message import ChatType
+from nekro_agent.schemas.chat_message import ChatMessage, ChatType
 from nekro_agent.tools.message_id import normalize_ref_msg_id
 from pydantic import Field, field_validator
 
@@ -35,7 +35,7 @@ plugin = NekroPlugin(
     name="MiMo 文本转语音",
     module_name="mimo_tts",
     description="基于小米 MiMo-V2.5-TTS 系列模型，将文本合成为语音消息并发送到群聊或私聊。",
-    version="0.2.0",
+    version="0.3.0",
     author="Sakuralis",
     url="https://github.com/leopard-1/nekro-plugin-mimo-tts",
     support_adapter=[
@@ -172,6 +172,24 @@ class MiMoTTSConfig(ConfigBase):
         ge=60,
         le=86400,
     )
+    SYNC_TEXT_WITH_VOICE: bool = Field(
+        default=False,
+        title="文字与语音同步发送",
+        description=(
+            "开启后，自动回复会同时发送文字和语音，避免只发语音导致用户看不到文字。"
+            "关闭时默认只发语音；用户说“打字/用文字”等提示时会临时改为同步发送。"
+        ),
+    )
+    TEXT_SYNC_TURNS: int = Field(
+        default=5,
+        title="临时同步发送轮数",
+        description=(
+            "用户说“打字/用文字”等提示后，临时开启文字+语音同步的用户回合数。"
+            "用户明确说“接下来N次”时以用户说明为准。"
+        ),
+        ge=1,
+        le=50,
+    )
     MAX_SEGMENTS_PER_MESSAGE: int = Field(
         default=4,
         title="单次最多语音条数",
@@ -201,6 +219,67 @@ _ORIGINAL_SEND_TEXT: Any = None
 _VOICE_FAILURE_UNTIL: float = 0.0
 _VOICE_FAILURE_REASON: str = ""
 _VOICE_FAILURE_LOGGED_AT: float = 0.0
+
+TEXT_MODE_SYNC = "sync"
+TEXT_MODE_VOICE = "voice"
+TEXT_MODE_TEXT = "text"
+TEXT_MODE_AUTO = "auto"
+TEXT_MODE_LABELS = {
+    TEXT_MODE_SYNC: "文字+语音同步",
+    TEXT_MODE_VOICE: "仅语音",
+    TEXT_MODE_TEXT: "仅文字",
+}
+_TEXT_MODE_OVERRIDES: dict[str, dict[str, Any]] = {}
+_TEXT_MODE_PENDING: set[str] = set()
+
+_COUNT_RE = re.compile(r"(\d+)\s*(?:次|条|轮|回合|句)")
+_PERSIST_RE = re.compile(r"以后|今后|往后|每次|一直|始终|永久")
+_RESET_RE = re.compile(r"恢复默认|自动模式|正常模式|默认模式")
+_TEXT_ONLY_RE = re.compile(
+    r"只要文字|仅文字|只用文字|只发文字|只打字|不要语音|别发语音|不用语音|别用语音|不要发语音|"
+    r"文字就行|文字即可|打字就行|不想听语音|不想用语音|别念",
+)
+_VOICE_ONLY_RE = re.compile(
+    r"只要语音|仅语音|只用语音|只发语音|不要文字|别打字|不要打字|别打文字|不用打字|不用文字|别发文字|不用发文字|"
+    r"不要发文字|语音就行|语音即可|不想看文字|取消同步|关闭同步|停止同步|不用同步|不要同步|别同步|不同步",
+)
+_SYNC_WORD_RE = re.compile(r"打字|打文字|文字|文本|同步|文字和语音|语音和文字|一起发")
+_SYNC_INTENT_RE = re.compile(
+    r"以后|今后|往后|每次|一直|始终|请|麻烦|帮我|给我|我要|能不能|可以|能否|"
+    r"改成|切换|使用|用|发|回复|接下来|同步",
+)
+_SYNC_EXACT = {
+    "打字",
+    "打文字",
+    "文字",
+    "文本",
+    "用文字",
+    "发文字",
+    "文字回复",
+    "文本回复",
+    "同步",
+    "同步发送",
+    "同步输出",
+    "文字和语音",
+    "语音和文字",
+    "语音同步",
+    "一起发",
+    "文字语音",
+    "语音文字",
+}
+_SYNC_PREFIXES = (
+    "打字",
+    "打文字",
+    "文字",
+    "文本",
+    "同步",
+    "用文字",
+    "发文字",
+    "文字和语音",
+    "语音和文字",
+    "语音同步",
+    "一起发",
+)
 
 
 def _normalize_model() -> str:
@@ -296,6 +375,138 @@ async def _is_channel_allowed(chat_key: str) -> bool:
 
     normalized_chat_key = _normalize_supported_channel_key(chat_key) or chat_key
     return normalized_chat_key in _supported_chat_keys()
+
+
+def _text_mode_state_key(chat_key: str) -> str:
+    return _normalize_supported_channel_key(chat_key) or chat_key
+
+
+def _set_text_mode_override(chat_key: str, mode: str, remaining: int) -> None:
+    key = _text_mode_state_key(chat_key)
+    _TEXT_MODE_OVERRIDES[key] = {
+        "mode": mode,
+        "remaining": remaining,
+    }
+    if remaining < 0:
+        _TEXT_MODE_PENDING.discard(key)
+
+
+def _clear_text_mode_override(chat_key: str) -> None:
+    key = _text_mode_state_key(chat_key)
+    _TEXT_MODE_OVERRIDES.pop(key, None)
+    _TEXT_MODE_PENDING.discard(key)
+
+
+def _get_text_mode_override(chat_key: str) -> dict[str, Any] | None:
+    return _TEXT_MODE_OVERRIDES.get(_text_mode_state_key(chat_key))
+
+
+def _effective_text_mode(chat_key: str) -> str:
+    """用户临时设置优先于配置开关。"""
+    override = _get_text_mode_override(chat_key)
+    if override:
+        return str(override.get("mode") or TEXT_MODE_AUTO)
+    return TEXT_MODE_SYNC if config.SYNC_TEXT_WITH_VOICE else TEXT_MODE_VOICE
+
+
+def _consume_text_mode(chat_key: str) -> None:
+    """每个用户回合最多消耗一次临时设置；持续设置（-1）不消耗。"""
+    key = _text_mode_state_key(chat_key)
+    override = _TEXT_MODE_OVERRIDES.get(key)
+    if not override:
+        _TEXT_MODE_PENDING.discard(key)
+        return
+
+    remaining = int(override.get("remaining", 0))
+    if remaining < 0:
+        return
+
+    # 同一个用户回合里可能发送多条消息（进度、语音、同步文字），只计一次对话。
+    if key not in _TEXT_MODE_PENDING:
+        return
+    _TEXT_MODE_PENDING.discard(key)
+
+    remaining -= 1
+    if remaining <= 0:
+        _TEXT_MODE_OVERRIDES.pop(key, None)
+        plugin.logger.info(f"文字发送临时偏好已到期，恢复配置默认: {key}")
+    else:
+        override["remaining"] = remaining
+
+
+def _detect_text_mode_instruction(text: str) -> tuple[str, int] | None:
+    """从用户消息中识别发送方式偏好，返回 (模式, 剩余次数)。
+
+    次数为 -1 表示持续生效。识别失败返回 None。
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 160:
+        return None
+    if raw.startswith(("/", "!", "！")) or "```" in raw:
+        return None
+
+    compact = re.sub(r"\s+", "", raw)
+    if not compact:
+        return None
+
+    if _RESET_RE.search(compact):
+        return (TEXT_MODE_AUTO, 0)
+
+    if _TEXT_ONLY_RE.search(compact):
+        mode = TEXT_MODE_TEXT
+    elif _VOICE_ONLY_RE.search(compact):
+        mode = TEXT_MODE_VOICE
+    elif (
+        compact in _SYNC_EXACT
+        or compact.startswith(_SYNC_PREFIXES)
+        or (_SYNC_WORD_RE.search(compact) and _SYNC_INTENT_RE.search(compact))
+    ):
+        mode = TEXT_MODE_SYNC
+    else:
+        return None
+
+    turns = max(1, min(50, int(config.TEXT_SYNC_TURNS or 5)))
+    count_match = _COUNT_RE.search(compact)
+    if count_match:
+        turns = max(1, min(50, int(count_match.group(1))))
+    if _PERSIST_RE.search(compact):
+        turns = -1
+
+    return (mode, turns)
+
+
+def _text_mode_status(chat_key: str) -> str:
+    mode = _effective_text_mode(chat_key)
+    label = TEXT_MODE_LABELS.get(mode, mode)
+    override = _get_text_mode_override(chat_key)
+    if not override:
+        return f"{label}（跟随配置）"
+    remaining = int(override.get("remaining", 0))
+    if remaining < 0:
+        return f"{label}（用户设置，持续生效）"
+    return f"{label}（用户临时设置，剩余 {remaining} 轮对话）"
+
+
+def _text_mode_prompt(chat_key: str) -> str:
+    mode = _effective_text_mode(chat_key)
+    if mode == TEXT_MODE_SYNC:
+        text = (
+            "当前为文字+语音同步模式：调用一次 `send_mimo_tts_message` 会同时发送文字和语音，"
+            "不要再额外调用 `send_text`，避免重复。"
+        )
+    elif mode == TEXT_MODE_TEXT:
+        text = "当前用户要求仅发送文字：不要调用 `send_mimo_tts_message`，直接使用 `send_text` 发送文字。"
+    else:
+        text = (
+            "当前为仅语音模式：调用 `send_mimo_tts_message` 发送语音。"
+            "若用户明确要求文字，请依赖插件根据用户最新说明切换的模式；"
+            "代码、表格等不适合朗读的内容可直接调用 `send_text`。"
+        )
+
+    override = _get_text_mode_override(chat_key)
+    if override and int(override.get("remaining", 0)) > 0:
+        text += f"（用户临时设置的偏好还剩 {override['remaining']} 轮对话）"
+    return text
 
 
 def _validate_text(text: str) -> str:
@@ -588,13 +799,28 @@ async def _send_audio_file(ctx: AgentCtx, chat_key: str, audio_path: Path, ref_m
     return "file"
 
 
+async def _send_text_direct(
+    ctx: AgentCtx,
+    chat_key: str,
+    text: str,
+    ref_msg_id: str | None = None,
+    *,
+    record: bool = True,
+) -> None:
+    """绕过自动 TTS 钩子直接发送文字。"""
+    token = _AUTO_TTS_BYPASS.set(True)
+    try:
+        if _ORIGINAL_SEND_TEXT is not None:
+            await _ORIGINAL_SEND_TEXT(chat_key, text, ctx, record=record, ref_msg_id=ref_msg_id)
+        else:
+            await ctx.ms.send_text(chat_key, text, ctx, record=record, ref_msg_id=ref_msg_id)
+    finally:
+        _AUTO_TTS_BYPASS.reset(token)
+
+
 async def _send_text_fallback(ctx: AgentCtx, chat_key: str, text: str, ref_msg_id: str | None = None) -> None:
     if config.FALLBACK_TEXT_ON_FAILURE:
-        token = _AUTO_TTS_BYPASS.set(True)
-        try:
-            await ctx.ms.send_text(chat_key, text, ctx, record=True, ref_msg_id=ref_msg_id)
-        finally:
-            _AUTO_TTS_BYPASS.reset(token)
+        await _send_text_direct(ctx, chat_key, text, ref_msg_id=ref_msg_id)
 
 
 def _should_auto_convert_text(message: str) -> bool:
@@ -627,25 +853,46 @@ async def _auto_tts_send_text(
 
     try:
         if await _is_channel_allowed(chat_key):
-            await _synthesize_and_send(ctx, chat_key, message, ref_msg_id=ref_msg_id)
+            await _synthesize_and_send(
+                ctx,
+                chat_key,
+                message,
+                ref_msg_id=ref_msg_id,
+                record=record,
+            )
             return
     except Exception as exc:
-        plugin.logger.exception(f"自动文本转语音失败，准备按配置回退文本: {exc}")
+        plugin.logger.exception(f"自动发送语音/文字失败，准备按配置回退文本: {exc}")
         if not config.FALLBACK_TEXT_ON_FAILURE:
             raise
 
-    token = _AUTO_TTS_BYPASS.set(True)
-    try:
-        await _ORIGINAL_SEND_TEXT(chat_key, message, ctx, record=record, ref_msg_id=ref_msg_id)
-    finally:
-        _AUTO_TTS_BYPASS.reset(token)
+    await _send_text_direct(ctx, chat_key, message, ref_msg_id=ref_msg_id, record=record)
+    _consume_text_mode(chat_key)
 
 
-async def _synthesize_and_send(ctx: AgentCtx, chat_key: str, text: str, ref_msg_id: str | None = None) -> str:
+async def _synthesize_and_send(
+    ctx: AgentCtx,
+    chat_key: str,
+    text: str,
+    ref_msg_id: str | None = None,
+    *,
+    record: bool = True,
+    allow_text_sync: bool = True,
+    consume_mode: bool = True,
+) -> str:
     if not await _is_channel_allowed(chat_key):
         raise PermissionError("当前频道未启用 MiMo 文本转语音")
 
+    text_mode = _effective_text_mode(chat_key) if allow_text_sync else TEXT_MODE_VOICE
     cleaned_text = _validate_text(text)
+    text_content = (text or "").strip() or cleaned_text
+    if text_mode == TEXT_MODE_TEXT:
+        await _send_text_direct(ctx, chat_key, text_content, ref_msg_id=ref_msg_id, record=record)
+        if consume_mode:
+            _consume_text_mode(chat_key)
+        return "已按用户当前偏好改为文字发送"
+
+    sync_text = text_mode == TEXT_MODE_SYNC
     chunks = _split_text(cleaned_text)
     if not chunks:
         raise ValueError("语音文本为空")
@@ -681,7 +928,24 @@ async def _synthesize_and_send(ctx: AgentCtx, chat_key: str, text: str, ref_msg_
         summary_parts.append(f"{voice_count} 条语音")
     if file_count:
         summary_parts.append(f"{file_count} 个音频文件")
+
+    if sync_text:
+        try:
+            await _send_text_direct(
+                ctx,
+                chat_key,
+                text_content,
+                ref_msg_id=ref_msg_id,
+                record=record,
+            )
+            summary_parts.append("1 条文字")
+        except Exception as exc:
+            plugin.logger.warning(f"同步文字发送失败: {exc}")
+
     summary = "、".join(summary_parts) or "0 条音频"
+
+    if consume_mode:
+        _consume_text_mode(chat_key)
 
     duration_text = ", ".join(f"{d:.1f}s" for d in durations if d)
     suffix = f"（{duration_text}）" if duration_text else ""
@@ -706,17 +970,20 @@ async def mimo_tts_prompt(ctx: AgentCtx) -> str:
     mode = "流式" if config.STREAM_OUTPUT else "非流式"
     return (
         "MiMo 文本转语音插件已在当前频道启用。"
-        f"当你需要发送最终文字回复时，优先调用 `send_mimo_tts_message(chat_key, text)` 将自然语言回复合成为语音消息发送；"
+        f"{_text_mode_prompt(ctx.chat_key)}"
         f"当前使用{style}，{mode}合成。"
         "语音文本应是适合朗读的自然语句，不要包含文件路径、调试信息、Markdown 表格或长代码块。"
-        "如用户明确要求文字回复，或内容不适合语音朗读，再使用普通文本发送。"
+        "用户可以用“打字/用文字/不要语音/不要文字”等说法临时改变发送方式，以用户最新说明为准。"
     )
 
 
 @plugin.mount_sandbox_method(
     SandboxMethodType.TOOL,
     name="发送 MiMo TTS 语音消息",
-    description="将指定文本通过小米 MiMo-V2.5-TTS 合成为语音，并发送到群聊或私聊。",
+    description=(
+        "将指定文本通过小米 MiMo-V2.5-TTS 合成为语音并发送到群聊或私聊。"
+        "当前为文字+语音同步模式时会同时发送文字。"
+    ),
 )
 async def send_mimo_tts_message(
     ctx: AgentCtx,
@@ -728,7 +995,8 @@ async def send_mimo_tts_message(
 
     Args:
         chat_key (str): 目标聊天频道标识，通常使用当前聊天的 `_ck`。
-        text (str): 要合成为语音并发送的自然语言文本。必须是适合朗读的最终回复。
+        text (str): 要合成为语音并发送的自然语言文本。必须是适合朗读的最终回复；
+            当前为文字+语音同步模式时，也会作为文字消息发送。
         ref_msg_id (str | None): 可选引用消息 ID，部分适配器可用。
 
     Returns:
@@ -781,7 +1049,13 @@ async def mimo_tts_cmd(
 
     ctx = await AgentCtx.create_by_chat_key(context.chat_key)
     try:
-        result = await _synthesize_and_send(ctx, context.chat_key, text)
+        result = await _synthesize_and_send(
+            ctx,
+            context.chat_key,
+            text,
+            allow_text_sync=False,
+            consume_mode=False,
+        )
         return CmdCtl.success(result)
     except Exception as exc:
         plugin.logger.exception(f"MiMo TTS 命令执行失败: {exc}")
@@ -791,6 +1065,46 @@ async def mimo_tts_cmd(
             except Exception as fallback_exc:
                 plugin.logger.warning(f"MiMo TTS 文本回退发送失败: {fallback_exc}")
         return CmdCtl.failed(f"MiMo TTS 失败：{exc}")
+
+
+@plugin.mount_command(
+    name="mimo_tts_text",
+    description="设置 MiMo TTS 的文字/语音发送模式。",
+    aliases=["mimo_tts_mode", "tts_text", "文字模式", "语音模式"],
+    usage="/mimo_tts_text <on|off|text|auto>",
+    permission=CommandPermission.PUBLIC,
+    category="语音",
+    tags=["tts", "voice", "text"],
+)
+async def mimo_tts_text_cmd(
+    context: CommandExecutionContext,
+    mode: Annotated[str, Arg("on=文字+语音，off=仅语音，text=仅文字，auto=跟随配置", positional=True)] = "",
+) -> CommandResponse:
+    if not await _is_channel_allowed(context.chat_key):
+        return CmdCtl.failed("当前频道未启用 MiMo 文本转语音，请先开启总开关并配置频道")
+
+    value = mode.strip().lower()
+    if not value:
+        return CmdCtl.success(
+            f"当前文字发送模式：{_text_mode_status(context.chat_key)}\n"
+            "用法：/mimo_tts_text on（文字+语音）| off（仅语音）| text（仅文字）| auto（跟随配置）",
+        )
+
+    if value in {"auto", "reset", "default", "默认", "自动"}:
+        _clear_text_mode_override(context.chat_key)
+        return CmdCtl.success(f"已恢复跟随配置：{_text_mode_status(context.chat_key)}")
+
+    if value in {"on", "sync", "both", "同步", "文字+语音", "文字和语音"}:
+        target = TEXT_MODE_SYNC
+    elif value in {"off", "voice", "语音", "仅语音"}:
+        target = TEXT_MODE_VOICE
+    elif value in {"text", "only_text", "仅文字", "文字"}:
+        target = TEXT_MODE_TEXT
+    else:
+        return CmdCtl.failed("未知模式，请使用 on（文字+语音）、off（仅语音）、text（仅文字）或 auto（跟随配置）")
+
+    _set_text_mode_override(context.chat_key, target, -1)
+    return CmdCtl.success(f"已切换为{TEXT_MODE_LABELS[target]}（持续生效，直到修改或重启插件）")
 
 
 @plugin.mount_command(
@@ -817,6 +1131,7 @@ async def mimo_tts_status_cmd(context: CommandExecutionContext) -> CommandRespon
         f"音色：{'自定义人设' if config.CUSTOM_PERSONA.strip() else _normalize_voice()}",
         f"单条最长：{config.MAX_VOICE_DURATION}s（约 {estimated_limit} 字/段）",
         f"语音发送：{_voice_status_text()}",
+        f"文字发送：{_text_mode_status(context.chat_key)}",
         f"API Key：{'已填写' if config.MIMO_API_KEY.strip() else '未填写'}",
         f"适配器：{ctx.adapter_key}",
     ]
@@ -825,11 +1140,46 @@ async def mimo_tts_status_cmd(context: CommandExecutionContext) -> CommandRespon
     return CmdCtl.success("\n".join(lines))
 
 
+@plugin.mount_on_user_message()
+async def capture_text_mode_hint(ctx: AgentCtx, message: ChatMessage) -> None:
+    """识别用户“打字/不要语音”等发送方式偏好，并临时/持续生效。"""
+    del ctx
+    if not await _is_channel_allowed(message.chat_key):
+        return None
+
+    state_key = _text_mode_state_key(message.chat_key)
+    if state_key in _TEXT_MODE_OVERRIDES:
+        # 新用户回合开始，允许本次回复消耗一次临时次数。
+        _TEXT_MODE_PENDING.add(state_key)
+
+    detected = _detect_text_mode_instruction(message.content_text)
+    if not detected:
+        return None
+
+    mode, turns = detected
+    if mode == TEXT_MODE_AUTO:
+        _clear_text_mode_override(message.chat_key)
+        _TEXT_MODE_PENDING.discard(state_key)
+        plugin.logger.info(f"用户要求恢复默认文字发送模式: {message.chat_key}")
+        return None
+
+    _set_text_mode_override(message.chat_key, mode, turns)
+    if turns > 0:
+        _TEXT_MODE_PENDING.add(state_key)
+    duration = "持续生效" if turns < 0 else f"{turns} 轮对话"
+    plugin.logger.info(
+        f"检测到用户文字发送偏好: {message.chat_key} -> {TEXT_MODE_LABELS[mode]}（{duration}）",
+    )
+    return None
+
+
 @plugin.on_enabled()
 async def install_auto_tts_hook() -> None:
     global _ORIGINAL_SEND_TEXT, _VOICE_FAILURE_UNTIL
 
     _VOICE_FAILURE_UNTIL = 0.0
+    _TEXT_MODE_OVERRIDES.clear()
+    _TEXT_MODE_PENDING.clear()
 
     from nekro_agent.api import message as message_api
 
