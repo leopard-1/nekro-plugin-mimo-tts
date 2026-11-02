@@ -246,7 +246,7 @@ _VOICE_ONLY_RE = re.compile(
 _SYNC_WORD_RE = re.compile(r"打字|打文字|文字|文本|同步|文字和语音|语音和文字|一起发")
 _SYNC_INTENT_RE = re.compile(
     r"以后|今后|往后|每次|一直|始终|请|麻烦|帮我|给我|我要|能不能|可以|能否|"
-    r"改成|切换|使用|用|发|回复|接下来|同步",
+    r"改成|切换|使用|用|发|回复|接下来",
 )
 _SYNC_EXACT = {
     "打字",
@@ -267,12 +267,17 @@ _SYNC_EXACT = {
     "文字语音",
     "语音文字",
 }
+_VOICE_EXACT = {
+    "语音",
+    "发语音",
+    "用语音",
+    "语音回复",
+    "语音发送",
+    "回语音",
+}
 _SYNC_PREFIXES = (
     "打字",
     "打文字",
-    "文字",
-    "文本",
-    "同步",
     "用文字",
     "发文字",
     "文字和语音",
@@ -454,7 +459,7 @@ def _detect_text_mode_instruction(text: str) -> tuple[str, int] | None:
 
     if _TEXT_ONLY_RE.search(compact):
         mode = TEXT_MODE_TEXT
-    elif _VOICE_ONLY_RE.search(compact):
+    elif _VOICE_ONLY_RE.search(compact) or compact in _VOICE_EXACT:
         mode = TEXT_MODE_VOICE
     elif (
         compact in _SYNC_EXACT
