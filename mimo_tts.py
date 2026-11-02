@@ -35,7 +35,7 @@ plugin = NekroPlugin(
     name="MiMo 文本转语音",
     module_name="mimo_tts",
     description="基于小米 MiMo-V2.5-TTS 系列模型，将文本合成为语音消息并发送到群聊或私聊。",
-    version="0.3.0",
+    version="0.4.0",
     author="Sakuralis",
     url="https://github.com/leopard-1/nekro-plugin-mimo-tts",
     support_adapter=[
@@ -286,6 +286,14 @@ _SYNC_PREFIXES = (
     "一起发",
 )
 
+_MD_LINK_RE = re.compile(
+    r"\[([^\]]+)\]\(((?:https?://|ftp://|www\.)[^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)",
+)
+_URL_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])(?:https?://|ftp://|www\.)[^\s<>\"'`]+")
+_URL_TRAILING_CHARS = ".,;:!?，。；：！？、）)]}】》」』\"'"
+_LINK_PLACEHOLDER = "（链接已单独发送）"
+_LINK_FAILED_PLACEHOLDER = "（链接发送失败）"
+
 
 def _normalize_model() -> str:
     model = (config.MODEL or "mimo-v2.5-tts").strip()
@@ -516,6 +524,51 @@ def _text_mode_prompt(chat_key: str) -> str:
     if override and int(override.get("remaining", 0)) > 0:
         text += f"（用户临时设置的偏好还剩 {override['remaining']} 轮对话）"
     return text
+
+
+def _trim_link(url: str) -> str:
+    value = (url or "").strip().strip("<>")
+    while value and value[-1] in _URL_TRAILING_CHARS:
+        value = value[:-1]
+    return value
+
+
+def _extract_links(text: str) -> tuple[str, list[str]]:
+    """把文本中的链接替换为“已单独发送”提示，返回 (可朗读文本, 链接列表)。"""
+    source = text or ""
+    links: list[str] = []
+
+    def add_link(url: str) -> None:
+        cleaned = _trim_link(url)
+        if cleaned and cleaned not in links:
+            links.append(cleaned)
+
+    def replace_markdown(match: re.Match[str]) -> str:
+        add_link(match.group(2))
+        return match.group(1).strip()
+
+    def replace_url(match: re.Match[str]) -> str:
+        add_link(match.group(0))
+        return ""
+
+    spoken = _MD_LINK_RE.sub(replace_markdown, source)
+    spoken = re.sub(r"<(https?://[^>]+)>", r"\1", spoken)
+    spoken = _URL_RE.sub(replace_url, spoken)
+
+    if not links:
+        return source.strip(), []
+
+    spoken = re.sub(r"[ \t]{2,}", " ", spoken)
+    spoken = re.sub(r"\s+([，。！？；：、,.!?;:])", r"\1", spoken)
+    spoken = re.sub(r"[，,]\s*([。！？!?])", r"\1", spoken)
+    spoken = re.sub(r"([。！？!?])\s*[，,]", r"\1", spoken)
+    spoken = re.sub(r"([，。！？；：、])\1+", r"\1", spoken)
+    spoken = re.sub(r"^[\s，。！？；：、,.!?;:]+", "", spoken).strip()
+    if re.search(r"[\w\u4e00-\u9fff]", spoken):
+        spoken = f"{spoken}{_LINK_PLACEHOLDER}"
+    else:
+        spoken = ""
+    return spoken, links
 
 
 def _validate_text(text: str) -> str:
@@ -827,9 +880,39 @@ async def _send_text_direct(
         _AUTO_TTS_BYPASS.reset(token)
 
 
+async def _send_link_message(
+    ctx: AgentCtx,
+    chat_key: str,
+    links: list[str],
+    ref_msg_id: str | None = None,
+    *,
+    record: bool = True,
+) -> bool:
+    """把链接作为单独的文字消息发送，并提示用户链接未被朗读。"""
+    if not links:
+        return False
+
+    if len(links) == 1:
+        content = f"链接无法朗读，已单独发送：\n{links[0]}"
+    else:
+        lines = [f"检测到 {len(links)} 个链接，无法朗读，已单独发送："]
+        lines.extend(f"{index}. {url}" for index, url in enumerate(links, start=1))
+        content = "\n".join(lines)
+
+    try:
+        await _send_text_direct(ctx, chat_key, content, ref_msg_id=ref_msg_id, record=record)
+    except Exception as exc:
+        plugin.logger.warning(f"链接文字消息发送失败: {exc}")
+        return False
+    return True
+
+
 async def _send_text_fallback(ctx: AgentCtx, chat_key: str, text: str, ref_msg_id: str | None = None) -> None:
-    if config.FALLBACK_TEXT_ON_FAILURE:
-        await _send_text_direct(ctx, chat_key, text, ref_msg_id=ref_msg_id)
+    if not config.FALLBACK_TEXT_ON_FAILURE:
+        return
+    fallback_text, _ = _extract_links(text)
+    if fallback_text:
+        await _send_text_direct(ctx, chat_key, fallback_text, ref_msg_id=ref_msg_id)
 
 
 def _should_auto_convert_text(message: str) -> bool:
@@ -875,7 +958,9 @@ async def _auto_tts_send_text(
         if not config.FALLBACK_TEXT_ON_FAILURE:
             raise
 
-    await _send_text_direct(ctx, chat_key, message, ref_msg_id=ref_msg_id, record=record)
+    fallback_text, _ = _extract_links(message)
+    if fallback_text:
+        await _send_text_direct(ctx, chat_key, fallback_text, ref_msg_id=ref_msg_id, record=record)
     _consume_text_mode(chat_key)
 
 
@@ -902,7 +987,29 @@ async def _synthesize_and_send(
         return "已按用户当前偏好改为文字发送"
 
     sync_text = text_mode == TEXT_MODE_SYNC
-    chunks = _split_text(cleaned_text)
+    spoken_text, links = _extract_links(text_content)
+    links_sent = False
+    if links:
+        links_sent = await _send_link_message(
+            ctx,
+            chat_key,
+            links,
+            ref_msg_id=ref_msg_id,
+            record=record,
+        )
+        if not links_sent:
+            spoken_text = spoken_text.replace(_LINK_PLACEHOLDER, _LINK_FAILED_PLACEHOLDER)
+
+    if not spoken_text:
+        if links:
+            if not links_sent:
+                raise RuntimeError("链接消息发送失败，且文本中没有可朗读内容")
+            if consume_mode:
+                _consume_text_mode(chat_key)
+            return f"已发送 {len(links)} 个链接（文本中没有可朗读内容）"
+        raise ValueError("语音文本为空")
+
+    chunks = _split_text(spoken_text)
     if not chunks:
         raise ValueError("语音文本为空")
 
@@ -927,7 +1034,7 @@ async def _synthesize_and_send(
             if audio_path:
                 audio_path.unlink(missing_ok=True)
 
-    if len(chunks) == max(1, int(config.MAX_SEGMENTS_PER_MESSAGE or 1)) and len("".join(chunks)) < len(cleaned_text):
+    if len(chunks) == max(1, int(config.MAX_SEGMENTS_PER_MESSAGE or 1)) and len("".join(chunks)) < len(spoken_text):
         plugin.logger.warning("文本过长，已按 MAX_SEGMENTS_PER_MESSAGE 截断后合成")
 
     voice_count = sent_modes.count("voice")
@@ -937,13 +1044,15 @@ async def _synthesize_and_send(
         summary_parts.append(f"{voice_count} 条语音")
     if file_count:
         summary_parts.append(f"{file_count} 个音频文件")
+    if links:
+        summary_parts.append(f"{len(links)} 个链接" if links_sent else f"{len(links)} 个链接（发送失败）")
 
     if sync_text:
         try:
             await _send_text_direct(
                 ctx,
                 chat_key,
-                text_content,
+                spoken_text,
                 ref_msg_id=ref_msg_id,
                 record=record,
             )
