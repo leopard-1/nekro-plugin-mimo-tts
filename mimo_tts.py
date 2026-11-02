@@ -433,8 +433,10 @@ def _consume_text_mode(chat_key: str) -> None:
 
     remaining -= 1
     if remaining <= 0:
-        _TEXT_MODE_OVERRIDES.pop(key, None)
-        plugin.logger.info(f"文字发送临时偏好已到期，恢复配置默认: {key}")
+        # 保留到本轮结束，避免同一轮后续消息（进度/分段）失去同步；
+        # 下一次用户消息到来时再由 capture_text_mode_hint 清理。
+        override["remaining"] = 0
+        plugin.logger.info(f"文字发送临时偏好已用完，本轮结束后恢复配置默认: {key}")
     else:
         override["remaining"] = remaining
 
@@ -489,6 +491,8 @@ def _text_mode_status(chat_key: str) -> str:
     remaining = int(override.get("remaining", 0))
     if remaining < 0:
         return f"{label}（用户设置，持续生效）"
+    if remaining == 0:
+        return f"{label}（本轮有效，下一轮恢复）"
     return f"{label}（用户临时设置，剩余 {remaining} 轮对话）"
 
 
@@ -1153,7 +1157,13 @@ async def capture_text_mode_hint(ctx: AgentCtx, message: ChatMessage) -> None:
         return None
 
     state_key = _text_mode_state_key(message.chat_key)
-    if state_key in _TEXT_MODE_OVERRIDES:
+    override = _TEXT_MODE_OVERRIDES.get(state_key)
+    if override and int(override.get("remaining", 0)) <= 0:
+        # 上一轮已经用完最后一次；新回合开始，恢复配置默认。
+        _TEXT_MODE_OVERRIDES.pop(state_key, None)
+        _TEXT_MODE_PENDING.discard(state_key)
+        override = None
+    if override:
         # 新用户回合开始，允许本次回复消耗一次临时次数。
         _TEXT_MODE_PENDING.add(state_key)
 
